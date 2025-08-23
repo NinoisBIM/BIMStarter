@@ -207,7 +207,7 @@ else:
 
             # Area: try common BIPs, then name-fallback
             area_bips = []
-            for name in ["ROOM_AREA", "HOST_AREA_COMPUTED", "AREA"]:
+            for name in ["AREA"]:
                 try:
                     area_bips.append(getattr(BuiltInParameter, name))
                 except:
