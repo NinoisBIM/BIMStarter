@@ -1,0 +1,264 @@
+import clr
+clr.AddReference('RevitServices')
+from RevitServices.Persistence import DocumentManager
+from RevitServices.Transactions import TransactionManager
+uiapp = DocumentManager.Instance.CurrentUIApplication
+uidoc = uiapp.ActiveUIDocument
+doc = uidoc.Document
+clr.AddReference('RevitAPI')
+from Autodesk.Revit.DB import *
+
+# ---------------- Config ----------------
+PREFIX = "KQ-"                         # schedule name prefix
+INCLUDE_LINKED = True                  # DEFAULT: include elements in linked files
+DONT_ITEMIZE = True                    # show totals/aggregation
+OPEN_FIRST_SCHEDULE = True             # open first created to show result
+ONLY_CATEGORIES_WITH_ELEMENTS = False  # do NOT skip empty categories
+
+# -------------- Helpers -----------------
+def make_schedule(doc, cat_id):
+    if hasattr(ViewSchedule, 'Create'):
+        return ViewSchedule.Create(doc, cat_id)
+    elif hasattr(ViewSchedule, 'CreateSchedule'):
+        return ViewSchedule.CreateSchedule(doc, cat_id)
+    else:
+        raise Exception("No ViewSchedule factory on this Revit version.")
+
+def unique_name(doc, base):
+    existing = set(v.Name for v in FilteredElementCollector(doc).OfClass(ViewSchedule))
+    if base not in existing:
+        return base
+    i = 2
+    while True:
+        candidate = "{} ({})".format(base, i)
+        if candidate not in existing:
+            return candidate
+        i += 1
+
+def is_model_category(cat):
+    try:
+        return cat.CategoryType == CategoryType.Model and not cat.IsTagCategory
+    except:
+        return False
+
+def valid_schedulable(cat):
+    try:
+        return is_model_category(cat) and ViewSchedule.IsValidCategoryForSchedule(cat.Id)
+    except:
+        return False
+
+def has_instances(doc, cat):
+    try:
+        bic = cat.BuiltInCategory
+    except:
+        return True
+    try:
+        return any(
+            FilteredElementCollector(doc)
+            .OfCategory(bic)
+            .WhereElementIsNotElementType()
+            .ToElements()
+        )
+    except:
+        return True
+
+def sfield_by_name(defn, names):
+    wl = [n.lower() for n in names]
+    for sf in defn.GetSchedulableFields():
+        try:
+            if sf.GetName(doc).lower() in wl:
+                return sf
+        except:
+            pass
+    return None
+
+def sfield_by_bip(defn, bip_list):
+    ids = set(ElementId(b) for b in bip_list if b is not None)
+    for sf in defn.GetSchedulableFields():
+        try:
+            if sf.ParameterId in ids:
+                return sf
+        except:
+            pass
+    return None
+
+def add_field(defn, sf):
+    if not sf:
+        return None
+    try:
+        return defn.AddField(sf)
+    except:
+        return None
+
+def add_count(defn):
+    try:
+        return defn.AddField(ScheduleFieldType.Count)
+    except:
+        return add_field(defn, sfield_by_name(defn, ["Count"]))
+
+def _try_set_bool(obj, prop_name, value):
+    try:
+        setattr(obj, prop_name, value)
+        return True
+    except:
+        try:
+            setter = getattr(obj, "set_" + prop_name)
+            setter(value)
+            return True
+        except:
+            return False
+
+def set_links(vs, value=True):
+    # Known properties across versions (try on view first, then on definition)
+    known = ("IncludeLinkedFiles", "IncludeElementsFromLinkedFiles", "IncludeElementsInLinkedFiles")
+    targets = [vs, getattr(vs, "Definition", None)]
+    for t in targets:
+        if t is None:
+            continue
+        for name in known:
+            if hasattr(t, name):
+                if _try_set_bool(t, name, value):
+                    return True
+    # Last resort: scan for any boolean property whose name contains "link"
+    for t in targets:
+        if t is None:
+            continue
+        for name in dir(t):
+            if "link" in name.lower():
+                try:
+                    attr = getattr(t, name)
+                except:
+                    continue
+                if isinstance(attr, bool):
+                    if _try_set_bool(t, name, value):
+                        return True
+    return False
+
+def add_sort(defn, field_obj):
+    try:
+        sfg = ScheduleSortGroupField(field_obj.FieldId)
+    except:
+        sfg = ScheduleSortGroupField(field_obj.FieldId.IntegerValue)
+    sfg.SortOrder = ScheduleSortOrder.Ascending
+    sfg.ShowHeader = False
+    defn.AddSortGroupField(sfg)
+
+def enable_totals(field_obj):
+    if not field_obj:
+        return
+    try:
+        if field_obj.CanTotal:
+            field_obj.DisplayType = ScheduleFieldDisplayType.Totals
+            field_obj.CalculateTotals = True
+    except:
+        pass
+
+# -------------- Main --------------------
+if hasattr(doc, "IsFamilyDocument") and doc.IsFamilyDocument:
+    OUT = ([], ["Open a Project RVT (not a Family)."])
+else:
+    cats = [c for c in doc.Settings.Categories if valid_schedulable(c)]
+    if ONLY_CATEGORIES_WITH_ELEMENTS:
+        cats = [c for c in cats if has_instances(doc, c)]
+
+    created, skipped = [], []
+    TransactionManager.Instance.EnsureInTransaction(doc)
+
+    for cat in cats:
+        vs = None
+        try:
+            vs = make_schedule(doc, cat.Id)
+            if not vs:
+                skipped.append(cat.Name + " :: could not create")
+                continue
+
+            vs.Name = unique_name(doc, PREFIX + cat.Name)
+
+            # Force the default you want on every schedule
+            if not set_links(vs, True if INCLUDE_LINKED else False):
+                skipped.append("{} :: could not enable 'Include elements in links'".format(cat.Name))
+
+            defn = vs.Definition
+            try:
+                defn.IsItemized = not DONT_ITEMIZE
+            except:
+                pass
+
+            # --- Family + Type (fallback: Family and Type) ---
+            fam_sf = (sfield_by_bip(defn, [BuiltInParameter.ELEM_FAMILY_PARAM,
+                                           BuiltInParameter.ALL_MODEL_FAMILY_NAME])
+                      or sfield_by_name(defn, ["Family"]))
+            typ_sf = (sfield_by_bip(defn, [BuiltInParameter.SYMBOL_NAME_PARAM,
+                                           BuiltInParameter.ELEM_TYPE_PARAM])
+                      or sfield_by_name(defn, ["Type", "Type Name"]))
+            fat_sf = None
+            if not (fam_sf and typ_sf):
+                fat_sf = (sfield_by_bip(defn, [BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM])
+                          or sfield_by_name(defn, ["Family and Type"]))
+
+            fam_col = add_field(defn, fam_sf) if fam_sf else None
+            typ_col = add_field(defn, typ_sf) if typ_sf else None
+            fat_col = None
+            if not (fam_col and typ_col):
+                fat_col = add_field(defn, fat_sf)
+
+            # --- Optional numeric fields: Length / Area / Volume ---
+            length_col = add_field(defn, sfield_by_name(defn, ["Length"]))
+
+            # Area: try common BIPs, then name-fallback
+            area_bips = []
+            for name in ["ROOM_AREA", "HOST_AREA_COMPUTED", "AREA"]:
+                try:
+                    area_bips.append(getattr(BuiltInParameter, name))
+                except:
+                    pass
+            area_sf = sfield_by_bip(defn, area_bips) or sfield_by_name(defn, ["Area"])
+            area_col = add_field(defn, area_sf)
+
+            volume_col = add_field(defn, sfield_by_name(defn, ["Volume"]))
+
+            for f in (length_col, area_col, volume_col):
+                enable_totals(f)
+
+            # --- Count ---
+            count_col = add_count(defn)
+            enable_totals(count_col)
+
+            # --- Sorting: Family → Type or Family and Type ---
+            try:
+                while defn.GetSortGroupFieldCount() > 0:
+                    defn.RemoveSortGroupField(0)
+            except:
+                pass
+            if fam_col and typ_col:
+                add_sort(defn, fam_col)
+                add_sort(defn, typ_col)
+            elif fat_col:
+                add_sort(defn, fat_col)
+
+            created.append(vs.Name)
+
+        except Exception as ex:
+            try:
+                if vs:
+                    doc.Delete(vs.Id)
+            except:
+                pass
+            skipped.append("{} :: {}".format(cat.Name, ex))
+
+    doc.Regenerate()
+
+    if OPEN_FIRST_SCHEDULE and created:
+        try:
+            target = None
+            for v in FilteredElementCollector(doc).OfClass(ViewSchedule):
+                if v.Name == created[0]:
+                    target = v
+                    break
+            if target:
+                uidoc.RequestViewChange(target)
+        except:
+            pass
+
+    TransactionManager.Instance.TransactionTaskDone()
+    OUT = (created, skipped, INCLUDE_LINKED)
