@@ -1,0 +1,190 @@
+// ==UserScript==
+// @name         ACC Takeoff: Clear Classifications (auto-scroll)
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  Clears Classification 1 & 2 for all Takeoff Types by auto-scrolling
+// @match        https://acc.autodesk.com/takeoff/*
+// @match        https://*.autodeskconstructioncloud.com/takeoff/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /**************** Settings ****************/
+  const PAUSE_BETWEEN_ROWS = 900;     // ms between rows
+  const AFTER_OPEN_DELAY   = 450;     // ms after clicking pencil
+  const AFTER_SAVE_DELAY   = 800;     // ms after Save
+  const SCROLL_STEP_DELAY  = 400;     // ms between auto-scroll steps
+  const MAX_IDLE_STEPS     = 6;       // stop when no new rows loaded after N steps
+
+  /**************** Selectors (with fallbacks) ****************/
+  const ROW_SELECTORS = [
+    'div[data-testid^="TakeoffTypeSummaryItem_"]',
+    'div[class*="TakeoffTypeSummaryItem"]'
+  ];
+  const EDIT_BUTTON_SELECTORS = [
+    'button[aria-label="icon-button"]',
+    'button[data-testid*="edit"]',
+    'button:has(svg[height="24"][width="24"])'
+  ];
+  const FLYOUT_SELECTORS = [
+    'div[class*="OutputDefinitionFlyout"]',
+    'div[role="dialog"]'
+  ];
+  const PRIMARY_HEADER_REGEX = /Primary output details/i;
+  const CLEAR_BTN_SELECTORS = [
+    // the “Clear” buttons you highlighted
+    'button.BasicButton__StyledButton',
+    'button:where(:not([disabled])):where(:not([aria-disabled="true"]))'
+  ];
+  const SAVE_BTN_SELECTORS = [
+    'button[data-testid*="save" i]',
+    'button[aria-label*="save" i]',
+    'button'
+  ];
+
+  /**************** Utilities ****************/
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const qsAny = (sels, root=document) => { for (const s of sels) { try { const el = root.querySelector(s); if (el) return el; } catch {} } return null; };
+  const qsaFirstWorking = (sels, root=document) => { for (const s of sels) { try { const list = root.querySelectorAll(s); if (list.length) return [...list]; } catch {} } return []; };
+  const fakeHover = (el) => ['mouseover','mouseenter','mousemove'].forEach(t => el.dispatchEvent(new MouseEvent(t,{bubbles:true})));
+  const findByText = (root, regex) => {
+    const all = root.querySelectorAll('*');
+    for (const n of all) {
+      const t = (n.textContent||'').trim();
+      if (regex.test(t)) return n;
+    }
+    return null;
+  };
+  const getRowKey = (row) => (row.textContent || '').trim(); // used to dedupe
+
+  const getScrollContainer = () => {
+    // pick the nearest scrollable ancestor of the first row
+    const first = qsaFirstWorking(ROW_SELECTORS)[0];
+    if (!first) return document.scrollingElement || document.documentElement;
+    let p = first.parentElement;
+    while (p) {
+      const style = getComputedStyle(p);
+      if (/(auto|scroll)/.test(style.overflowY) && p.scrollHeight > p.clientHeight) return p;
+      p = p.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  };
+
+  /**************** Row actions ****************/
+  async function openEdit(row) {
+    row.scrollIntoView({ block: 'center' });
+    fakeHover(row);
+    await sleep(200);
+    let edit = null;
+    for (const s of EDIT_BUTTON_SELECTORS) { edit = row.querySelector(s); if (edit) break; }
+    if (!edit) throw new Error('Edit (pencil) not found on row');
+    edit.click();
+    await sleep(AFTER_OPEN_DELAY);
+  }
+
+  async function expandPrimaryDetails() {
+    const flyout = qsAny(FLYOUT_SELECTORS) || document;
+    const header = findByText(flyout, PRIMARY_HEADER_REGEX);
+    if (header) { header.click(); await sleep(200); }
+  }
+
+  async function clearClassifications() {
+    const flyout = qsAny(FLYOUT_SELECTORS) || document;
+    // Prefer footer “Clear” buttons in the dropdowns (works for Class 1 & 2)
+    const clearButtons = [...flyout.querySelectorAll('button')].filter(b => /clear/i.test(b.textContent||''));
+    if (clearButtons.length) {
+      for (const b of clearButtons) { b.click(); await sleep(200); }
+      return;
+    }
+    // Fallback: click any button matching our clear selectors that says "Clear"
+    const btns = [...(flyout.querySelectorAll(CLEAR_BTN_SELECTORS.join(',')))];
+    for (const b of btns) {
+      if (/clear/i.test(b.textContent||'')) { b.click(); await sleep(200); }
+    }
+  }
+
+  async function saveFlyout() {
+    const flyout = qsAny(FLYOUT_SELECTORS) || document;
+    const candidates = [...flyout.querySelectorAll(SAVE_BTN_SELECTORS.join(','))];
+    const save = candidates.find(b => /save/i.test(b.textContent || b.getAttribute('aria-label') || '')) || candidates[0];
+    if (!save) throw new Error('Save button not found');
+    save.click();
+    await sleep(AFTER_SAVE_DELAY);
+  }
+
+  /**************** Main loop with auto-scroll & stop control ****************/
+  let STOP = false;
+
+  async function processVisibleBatch(processedKeys) {
+    const rows = qsaFirstWorking(ROW_SELECTORS);
+    for (const row of rows) {
+      if (STOP) return 'stopped';
+      const key = getRowKey(row);
+      if (processedKeys.has(key)) continue;
+      try {
+        await openEdit(row);
+        await expandPrimaryDetails();
+        await clearClassifications();
+        await saveFlyout();
+        processedKeys.add(key);
+        await sleep(PAUSE_BETWEEN_ROWS);
+      } catch (e) {
+        console.warn('Row failed:', e.message);
+        // attempt to close any modal
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await sleep(300);
+      }
+    }
+    return 'done';
+  }
+
+  async function autoScrollUntilEnd(processedKeys) {
+    const sc = getScrollContainer();
+    let idleSteps = 0;
+    while (!STOP) {
+      const beforeCount = qsaFirstWorking(ROW_SELECTORS).length;
+      sc.scrollBy({ top: sc.clientHeight * 0.9, behavior: 'smooth' });
+      await sleep(SCROLL_STEP_DELAY);
+      const afterCount = qsaFirstWorking(ROW_SELECTORS).length;
+      if (afterCount <= beforeCount) idleSteps++; else idleSteps = 0;
+      await processVisibleBatch(processedKeys);
+      if (idleSteps >= MAX_IDLE_STEPS) break; // no more new rows appear
+    }
+  }
+
+  async function run() {
+    STOP = false;
+    const processed = new Set();
+    await processVisibleBatch(processed);  // do current viewport
+    await autoScrollUntilEnd(processed);   // then keep loading and processing
+    if (!STOP) alert(`Done. Processed ~${processed.size} rows (unique by text).`);
+  }
+
+  /**************** UI: start/stop ****************/
+  // Hotkeys
+  document.addEventListener('keydown', (e) => {
+    if (e.shiftKey && e.altKey && e.code === 'KeyC') run();     // start
+    if (e.shiftKey && e.altKey && e.code === 'KeyX') {          // stop
+      STOP = true;
+      alert('Stopping after current row…');
+    }
+  });
+
+  // On-screen buttons
+  const startBtn = document.createElement('button');
+  startBtn.textContent = 'ACC: Clear Classifications (Start)';
+  Object.assign(startBtn.style, { position:'fixed', bottom:'16px', right:'16px', zIndex:999999, padding:'8px 12px' });
+  startBtn.onclick = run;
+
+  const stopBtn = document.createElement('button');
+  stopBtn.textContent = 'Stop';
+  Object.assign(stopBtn.style, { position:'fixed', bottom:'16px', right:'220px', zIndex:999999, padding:'8px 12px' });
+  stopBtn.onclick = () => { STOP = true; alert('Stopping after current row…'); };
+
+  window.addEventListener('load', () => {
+    document.body.appendChild(startBtn);
+    document.body.appendChild(stopBtn);
+  }, { once:true });
+})();
